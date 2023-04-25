@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema version="2.0"
+	targetNamespace="http://gisis.imo.org/XML/LRIT/dnidRequest/2008"
+	xmlns="http://gisis.imo.org/XML/LRIT/dnidRequest/2008" xmlns:xs="http://www.w3.org/2001/XMLSchema"
+	xmlns:lrit="http://gisis.imo.org/XML/LRIT/types/2008"
+	elementFormDefault="qualified">
+	<xs:import namespace="http://gisis.imo.org/XML/LRIT/types/2008"
+		schemaLocation="ASPTypes.xsd" />
+	<xs:simpleType name="messageTypeType">
+		<xs:restriction base="xs:integer">
+			<xs:enumeration value="18" />
+		</xs:restriction>
+	</xs:simpleType>
+	<xs:simpleType name="requestTypeType">
+		<xs:restriction base="xs:integer">
+			<xs:enumeration value="56" />
+			<xs:enumeration value="51" />
+		</xs:restriction>
+	</xs:simpleType>
+	<xs:simpleType name="dnidNoType">
+		<xs:restriction base="xs:string">
+			<xs:pattern value="[0-9]{5}" />
+		</xs:restriction>
+	</xs:simpleType>
+	<xs:simpleType name="memberNoType">
+		<xs:restriction base="xs:integer">
+			<xs:minInclusive value="0" />
+			<xs:maxInclusive value="255" />
+		</xs:restriction>
+	</xs:simpleType>
+	<xs:simpleType name="oceanRegionType">
+		<xs:restriction base="xs:integer">
+			<xs:enumeration value="0" />
+			<xs:enumeration value="1" />
+			<xs:enumeration value="2" />
+			<xs:enumeration value="3" />
+			<xs:enumeration value="9" />
+		</xs:restriction>
+	</xs:simpleType>
+	<xs:element name="DNIDRequest" type="DNIDRequestType" />
+	<xs:complexType name="DNIDRequestType">
+		<xs:sequence>
+			<xs:element name="MessageType" type="messageTypeType" />
+			<xs:element name="RequestType" type="requestTypeType" />
+			<xs:element name="MessageId" type="lrit:msgIDType" />
+			<xs:element name="IMONum" type="lrit:imoNumType" />
+			<xs:element name="DNIDNo" type="dnidNoType" />
+			<xs:element name="MemberNo" type="memberNoType" />
+			<xs:element name="OceanRegion" type="oceanRegionType" />
+			<xs:element name="DataUserRequestor" type="lrit:contractingGovernmentLRITIDType" />
+			<xs:element name="DataUserProvider" type="lrit:lritIDType" />	
+			<xs:element name="TimeStamp" type="xs:dateTime" />
+		</xs:sequence>
+		<xs:attribute name="test" type="lrit:testType" use="optional"
+			default="0" />
+		<xs:attribute name="schemaVersion" type="xs:decimal" use="required" />
+	</xs:complexType>
+</xs:schema>

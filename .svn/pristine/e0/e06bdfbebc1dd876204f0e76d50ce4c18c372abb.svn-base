@@ -1,0 +1,1508 @@
+//package in.gov.lrit.asp;
+package in.gov.lrit.asp.email;
+
+import in.gov.lrit.asp.common.DBUpdation;
+import in.gov.lrit.asp.common.PollCommands;
+import in.gov.lrit.asp.exception.EmailFormatException;
+import java.io.StringWriter;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.TimeZone;
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBException;
+import javax.xml.bind.Marshaller;
+import javax.xml.datatype.DatatypeConfigurationException;
+import javax.xml.datatype.DatatypeFactory;
+import javax.xml.datatype.XMLGregorianCalendar;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.imo.gisis.xml.lrit._2008.Response;
+import org.imo.gisis.xml.lrit.positionreport._2008.ShipPositionReportType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import in.gov.lrit.asp.exception.ReportProcessException;
+
+/**
+ * <h1>AspProcessEmail.java</h1> This class handles all the incomming emails and
+ * processes the pdn's and sends new commands to csp .
+ * 
+ * @copyright 2019 CDAC Mumbai. All rights reserved
+ * @author lrit-team
+ * @version 1.0
+ */
+
+public class AspProcessEmail implements Processor {
+	DBUpdation dbProcess;
+
+	public DBUpdation getDbProcess() {
+		return dbProcess;
+	}
+
+	public void setDbProcess(DBUpdation dbProcess) {
+		this.dbProcess = dbProcess;
+	}
+
+	PollCommands pollCommandType = new PollCommands();
+	Response resp = new Response();
+
+	Logger log = (Logger) LoggerFactory.getLogger(AspProcessEmail.class);
+
+	public void process(Exchange arg0) throws EmailFormatException, ReportProcessException, SQLException {
+
+		log.info("INSIDE PROCESSOR");
+		Timestamp receivedAtASP = dbProcess.getCurrentTimestamp();
+		String email = null;
+		email = arg0.getIn().getBody(String.class).trim();
+		log.info("Email is =" + email);
+
+		if (email == null) {
+			/*
+			 * log.error("Email body is Empty"); log.info("Generating fatal Message Error");
+			 * // If message body is empty then we are generating fatal Alert.
+			 * dbProcess.generateAlert(null, 113);
+			 */
+			throw new EmailFormatException(" BODY IS EMPTY");
+		}
+		String subject = (String) arg0.getIn().getHeader("subject");
+		String from = (String) arg0.getIn().getHeader("From");
+		String timestampAsString = (String) arg0.getIn().getHeader("Date");
+		log.info("NEW EMAIL RECEIVED ");
+		log.info("BODY OF EMAIL IS --- " + email);
+		log.info("SUBJECT OF EMAIL IS --- " + subject);
+		log.info("SENDER IS --- " + from);
+		log.info("TIMESTAMP IS --- " + timestampAsString);
+		String cspEmail = dbProcess.getGolbalProperties("FROM");
+		log.info("from and csp " + from + "  " + cspEmail);
+		boolean validate = false;
+
+		validate = emailValidation(from, cspEmail);
+		log.info("validate " + validate);
+		if (validate == false) {
+			log.error("INVALID SOURCE ");
+			arg0.getOut().setHeader("choice", "Invalid");
+			throw new EmailFormatException("Email NOT FROM VALID SOURCE");
+		}
+		/*
+		 * } catch (Exception e) {
+		 * log.error("invalid Source, Email cannot be processed");
+		 * log.error(" in Email_validation " + e.getMessage() + " *** " + e.getCause() +
+		 * " *** " + e.getStackTrace().toString()); }
+		 */
+
+		boolean flag = false;
+		String messageId = null;
+		String RDCid;
+
+		RDCid = this.dbProcess.getId("RDC");
+		log.info("RDCid = " + RDCid);
+		messageId = dbProcess.generateMessageID(RDCid.trim());
+		log.info("message id is " + messageId);
+
+		String aspId = this.dbProcess.getId("ASP");
+		String cspId = this.dbProcess.getId("CSP");
+		log.info("ASPpid =" + aspId);
+		String typeOfEmail = null;
+		typeOfEmail = identifyEmailType(email, subject.trim());
+		// log.info("Type of EMail:" + typeOfEmail);
+		// String NDN = "Negative Delivery notification";
+		// String PDN = "Positive Delivery no​tification​";
+		String PR = "Maritime Mobile Position Report";
+		// String UR = "Unknown Type Position Report";
+
+		/////////////////// Processing of Unknown Email type ///////////////////
+
+		if (typeOfEmail.trim().contains("Unknown")) {
+
+			log.info("EMAIL IS UNKNOWN POSITION REPORT");
+			String[] lines = email.split("\\r?\\n");
+
+			String stringtimestamp2 = null;
+
+			log.info("timestamp in report is" + stringtimestamp2);
+			String[] forthLine = lines[4].split(",");
+			String[] forDNID = forthLine[1].split(":");
+			String dnid = forDNID[1].trim();
+			log.info("DNID number is :[" + dnid + "]");
+			String[] forMem = forthLine[2].split(":");
+			String mem = forMem[1].trim();
+			log.info("Member number is :[" + mem + "]");
+			flag = dbProcess.logCspTransaction(null, cspId, aspId, dbProcess.getCurrentTimestamp(), subject,
+					Integer.valueOf(dnid), 0, Integer.valueOf(mem), null, email, "Unknown Position Report", false);
+
+			String[] data = new String[2];
+			data = dbProcess.getImoNumberandshipid(dnid.trim(), mem.trim());
+			String shipEquipmentID = data[0];
+
+			log.info("flag=" + flag);
+			if (flag == true) {
+				log.info("EMAIL LOGGED SUCCESSFULL");
+				dbProcess.generateAlert(shipEquipmentID, 120);
+			}
+
+		}
+
+		/////////////////// Processing of Position Report ///////////////////
+
+		else if (typeOfEmail.trim().contains(PR.trim())) {
+			////// Get details from email to insert Database //////
+			try {
+
+				log.info("EMAIL IS POSITION REPORT");
+				String[] lines = email.split("\\r?\\n");
+				/* ------------------------------------------------------------ */
+				/*
+				 * Line 1 is ignored because structured changed and NDC-LRIT said to ignore
+				 * parsing of 1st line
+				 */
+				/* ------------------------------------------------------------ */
+				// log.info(lines[0]);
+				// String[] firstLine = lines[0].split(" ");
+				// String stringtimestamp2 = null;
+				// log.info("CSP send report to ASP at: " + firstLine[3] + firstLine[4] +
+				// firstLine[5]);
+				// stringtimestamp2 = firstLine[3] + " " + firstLine[4] + " " + firstLine[5];
+				// log.info("Timestamp(Report send from CSP): " + stringtimestamp2);
+
+				String[] secondLine = lines[1].split(":");
+				String region = secondLine[3];
+				log.info("Region is  " + region);
+				String[] forthLine = lines[4].split(",");
+				String[] forDNID = forthLine[1].split(":");
+				String dnid = forDNID[1].trim();
+				log.info("DNID is  " + dnid);
+				String[] forMem = forthLine[2].split(":");
+				String mem = forMem[1];
+				log.info("Member number is  " + mem);
+				String[] data = new String[2];
+				String[] data1 = new String[3];
+				flag = dbProcess.logCspTransaction(null, "CSP", "ASP", dbProcess.getCurrentTimestamp(), subject,
+						Integer.valueOf(dnid), 0, Integer.valueOf(mem.trim()), null, email, "Position Report", false);
+				if (flag == true) {
+					log.info("EMAIL LOGGED SUCCESSFULL");
+				}
+
+				//////// fetching ImoNo. and Shipborne Equipment ////////
+				data = dbProcess.getImoNumberandshipid(dnid.trim(), mem.trim());
+				String imoNumber = data[1];
+				String shipEquipmentID = data[0];
+
+				if (imoNumber == null) {
+					log.error("DNID no and Member number does not map to any Imono." + dnid + " " + mem + " "
+							+ shipEquipmentID + "    ");
+					// dbProcess.generateAlert(dnid, mem, 119);
+					throw new EmailFormatException("Error");
+				}
+
+				log.info("shipquipmentid and imonumber is ::" + shipEquipmentID + " " + imoNumber);
+
+				/*
+				 * String shipStatus=dbProcess.fetchshipstatus(imoNumber);
+				 * if(!((shipStatus.equals("SHIP_REGISTERED"))||(shipStatus.equals(
+				 * "DNID_DOWNLOADED"))||(shipStatus.equals("SHIP_NOT_REGISTERED")))) { throw new
+				 * EmailFormatException("Error"); }
+				 */
+
+				String[] sixthLine = lines[6].split(":");
+				String[] forPosition = sixthLine[1].split(",");
+				String latitude = forPosition[0];
+				String longitude = forPosition[1];
+				if ((latitude.length() == 0) || (longitude.length() == 0)) {
+					log.info("Generating fatal Message Error");
+					dbProcess.generateAlert(shipEquipmentID, 113);
+					log.error("latitude and longitude not Proper ." + dnid + " " + mem + " " + shipEquipmentID);
+					throw new EmailFormatException("Error");
+				}
+
+				String[] getLat = latitude.split("\\s+");
+				Double degree = Double.parseDouble(getLat[1]);
+				String direction;
+				direction = getLat[3];
+
+				String[] getminute = getLat[2].split("'");
+				Double minute = 0.0;
+
+				if (getminute[0] == null || getminute[0].isEmpty())
+					log.error("Getting empty minute");
+				else
+					minute = Double.parseDouble(getminute[0]);
+
+				BigDecimal latitudeDecimal = this.convertLocation(degree, minute, direction);
+				String[] getLong = longitude.split("\\s+");
+				Double degreelong = Double.parseDouble(getLong[1]);
+				String[] getminutelong = getLong[2].split("'");
+				Double minutelong = Double.parseDouble(getminutelong[0]);
+				direction = getLong[3];
+				BigDecimal longitudeDecimal = this.convertLocation(degreelong, minutelong, direction);
+
+				log.info("position is -------  " + latitudeDecimal + "  " + longitudeDecimal);
+				String[] eighthLine = lines[8].split(",");
+				String[] forSpeed = eighthLine[0].split(":");
+				String[] speedvalue = forSpeed[1].split("\\s+");
+				if (speedvalue[1].length() == 0) {
+					log.info("Generating fatal Message Error");
+					dbProcess.generateAlert(shipEquipmentID, 113);
+					log.error("Speed is  not Proper in position Report ." + dnid + " " + mem + " " + shipEquipmentID);
+					throw new EmailFormatException("Error");
+				}
+
+				log.info("speed is ::" + speedvalue[1]);
+				BigDecimal speed = new BigDecimal(speedvalue[1]);
+
+				String[] forcourse = eighthLine[1].split(":");
+				String[] coursevalue = forcourse[1].split("\\s+");
+
+				if (coursevalue[1].length() == 0) {
+					log.info("Generating fatal Message Alert");
+					dbProcess.generateAlert(shipEquipmentID, 113);
+					log.error("latitude and longitude not Proper ." + dnid + " " + mem + " " + shipEquipmentID);
+					throw new EmailFormatException("Error");
+				}
+				BigDecimal course = new BigDecimal(coursevalue[1]);
+
+				log.info("speed and course  is  " + speed + " " + course);
+				flag = false;
+				String[] tenthLine = lines[10].split(":");
+				String forTime = null;
+				if (tenthLine[1].length() == 0) {
+					log.info("Generating spam alert");
+					dbProcess.generateAlert(shipEquipmentID, 114);
+					log.error("latitude and longitude not Proper ." + dnid + " " + mem + " " + shipEquipmentID);
+					throw new EmailFormatException("Error");
+				}
+				if (tenthLine[2].length() > 1) {
+					forTime = tenthLine[1] + ":" + tenthLine[2] + ":00";
+				} else
+					forTime = tenthLine[1] + ":" + tenthLine[2] + "0" + ":00";
+
+				log.info("ship position Time is ::" + forTime);
+
+				SimpleDateFormat dateFormat = new SimpleDateFormat("dd-MMM-yy HH:mm:ss");
+
+				Timestamp timeInPositionReport = null;
+				try {
+					timeInPositionReport = new Timestamp(((java.util.Date) dateFormat.parse(forTime)).getTime());
+				} catch (ParseException e) {
+					log.error("Error in Parsing timestamp");
+				}
+
+				String ddpVersionNo = null;
+				ddpVersionNo = dbProcess.getCurrentDDpVersion();
+				log.info("ddp version is " + ddpVersionNo);
+
+				String aspid = dbProcess.getId("ASP");
+				String cspid = dbProcess.getId("CSP");
+				String dcid = dbProcess.getId("RDC");
+				BigInteger messageType = BigInteger.valueOf(19);
+				// BigInteger testing = BigInteger.valueOf(0);
+
+				////// Storing in ASP-CSP Transaction Table ////////
+				boolean updateDb = dbProcess.insertAspDcTxn(messageId, null, RDCid, aspId,
+						dbProcess.getCurrentTimestamp(), messageType, imoNumber, "Position Report");
+				if (updateDb == true) {
+					log.info("logged in ASP-DC transaction");
+				}
+				String cspiD = dbProcess.getCspIdNew(Integer.valueOf(dnid), Integer.valueOf(mem.trim()));
+
+				log.debug("cspid from the table is " + cspiD);
+				dbProcess.insertcspdcmapping(messageId, cspiD);
+				log.debug("Inserted in CSP mapping");
+
+				// Method call to fetch MMSINo., shipname, shipType
+				data1 = dbProcess.fetchShipDetails(imoNumber);
+				String mmsiNum = data1[0];
+				String ship_name = data1[1];
+				String ship_type = data1[2];
+				log.info("ship name is: " + ship_name);
+				log.info("ship type is: " + ship_type);
+				String lrit_id = dbProcess.getCgOwnerFromIMONO(imoNumber);
+				log.info("lrit_id" + lrit_id);
+				if (lrit_id == null) {
+					throw new EmailFormatException("Error");
+				}
+				ShipPositionReportType shipPosition;
+				shipPosition = new ShipPositionReportType();
+				String[] splitLat = latitude.trim().split(" ");
+				for (String line : splitLat) {
+					log.debug(line);
+				}
+
+				String[] splitLong = longitude.trim().split(" ");
+				for (String line : splitLong) {
+					log.debug(line);
+				}
+				String mid1 = removeLastCharacter(splitLat[1]);
+				String mid2 = removeLastCharacter(splitLong[1]);
+
+				log.info("length of longi is" + splitLong[0].length());
+				if (splitLong[0].length() == 1) {
+					splitLong[0] = "00" + splitLong[0];
+				} else if (splitLong[0].length() == 2) {
+					splitLong[0] = "0" + splitLong[0];
+				}
+				if (splitLat[0].length() < 2) {
+					splitLat[0] = "0" + splitLat[0];
+				}
+
+				log.info("final lat=" + splitLat[0] + "." + mid1 + "." + splitLat[2]);
+				String newlat = splitLat[0] + "." + mid1 + "." + splitLat[2];
+				String newlong = splitLong[0] + "." + mid2 + "." + splitLong[2];
+				log.info("new longitude : " + newlong);
+				shipPosition.setLatitude(newlat.trim());
+				shipPosition.setLongitude(newlong.trim());
+
+				shipPosition.setSchemaVersion(new BigDecimal((System.getProperty("Schema_Version"))));
+				Timestamp timeStamp3 = dbProcess.getCurrentTimestamp();
+				log.info("lat : " + latitude + "long: " + longitude);
+
+				flag = dbProcess.logshippositionReport(messageId, newlat, newlong, timeInPositionReport, aspid, cspId,
+						shipEquipmentID, receivedAtASP, timeStamp3, dcid, speed, course, Integer.parseInt(imoNumber),
+						region, mmsiNum, messageType, lrit_id, lrit_id, ddpVersionNo, ship_type, ship_name, timeStamp3,
+						0);
+
+				/*
+				 * this code for generating the alert with alert_id 118 has been moved. Earlier,
+				 * alert was generated in between the processing of position report. As per
+				 * requirements, the code is to be executed after the position report is logged
+				 * into the database. (Edited by Neil)
+				 */
+
+				/*
+				 * long t1 = timeInPositionReport.getTime(); long t2 = receivedAtASP.getTime();
+				 * 
+				 * if (t1 > t2) { log.error("Timestamp1 > Timestamp2  T1:" + t1 + "  T2:" + t2);
+				 * log.info("Generating fatal Message Error"); // Generating fatal error if
+				 * T1>T2. dbProcess.generateAlert(shipEquipmentID, 113); }
+				 */
+
+				try {
+
+					long milliseconds1 = timeInPositionReport.getTime();
+					long milliseconds2 = receivedAtASP.getTime();
+					long diff = milliseconds2 - milliseconds1;
+					long diffMinutes = diff / (60 * 1000);
+					if (diffMinutes > 15) {
+						dbProcess.generateAlert(shipEquipmentID, 118);
+					}
+				} catch (Exception e) {
+					log.error("Error in generating alert");
+				}
+
+				if (flag == true) {
+					log.info("POSITION REPORT LOGGED IN DATABASE");
+				}
+
+				shipPosition.setTimeStamp1(timeStampToXMLGregorianCalender(timeInPositionReport));
+				shipPosition.setTimeStamp2(timeStampToXMLGregorianCalender(receivedAtASP));
+				shipPosition.setTimeStamp3(timeStampToXMLGregorianCalender(timeStamp3));
+				shipPosition.setDDPVersionNum(ddpVersionNo);
+				shipPosition.setShipborneEquipmentId(shipEquipmentID);
+				shipPosition.setASPId(aspid);
+				shipPosition.setCSPId(cspid);
+				shipPosition.setDataUserRequestor(lrit_id);
+				shipPosition.setMMSINum(mmsiNum);
+				shipPosition.setDCId(dcid);
+				shipPosition.setDataUserProvider(lrit_id);
+				shipPosition.setReferenceId("");
+				shipPosition.setMessageType(messageType);
+				shipPosition.setMessageId(messageId);
+				shipPosition.setIMONum(imoNumber);
+				shipPosition.setResponseType(BigInteger.valueOf(0));
+				shipPosition.setShipName(ship_name);
+				shipPosition.setTest(new BigInteger(System.getProperty("Test")));
+				// getXMLGregorianCalendar(timestamp2)
+				shipPosition.setTimeStamp4(timeStampToXMLGregorianCalender(timeStamp3));
+				shipPosition.setTimeStamp5(timeStampToXMLGregorianCalender(timeStamp3));
+				shipPosition.setShipType(ship_type);
+
+				arg0.getOut().setHeader("choice", "PR");
+				arg0.getOut().setBody(shipPosition);
+				boolean check = dbProcess.checkportalstatus(imoNumber);
+				log.debug("check is =" + true);
+				if (check == true) {
+					dbProcess.setportalVesselDetails(imoNumber, "SHIP_REGISTERED", dbProcess.getCurrentTimestamp());
+					dbProcess.generateAlert(shipEquipmentID, 107);
+				}
+				try {
+					log.info(marshallPositionReport(shipPosition));
+				} catch (JAXBException e) {
+					// TODO Auto-generated catch block
+					log.error("error in marshelling ");
+					throw new EmailFormatException("JAXBException");
+				}
+
+				if (arg0.getIn().getBody(Response.class) != null) {
+					log.info("response received");
+				}
+			} catch (Exception e) {
+				log.error("Error in Processing Position Report");
+				log.error("[" + messageId + "] in  processing_Position_report " + e.getMessage() + " *** "
+						+ e.getCause() + " *** " + e.getStackTrace().toString());
+			}
+
+		}
+
+		////////////// PROCESS OF NDN //////////////
+
+		else if (typeOfEmail.trim().contains("Negative")) {
+
+			log.info("EMAIL IS NEGATIVE DELIVERY NOTIFICATION");
+			String dnidno;
+			int mem = 0;
+			String[] lines = email.split("\\r?\\n");
+			for (String line : lines) {
+				log.info(line);
+			}
+			log.info("lines are" + lines.length);
+			String commandtype = null;
+			String shipBorneEquipmentId = null;
+			String referenceCspId = null;
+			boolean flag1 = false;
+			String status = "NDN Recceived";
+			if (lines.length == 7) {
+				String[] SeventhLine = lines[5].split(",");
+				dnidno = SeventhLine[2];
+
+				shipBorneEquipmentId = SeventhLine[5];
+				mem = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+				commandtype = SeventhLine[6].trim();
+				log.info("command type in NDN is " + commandtype);
+
+			} else {
+
+				String[] SeventhLine = lines[4].split(",");
+				dnidno = SeventhLine[2];
+
+				shipBorneEquipmentId = SeventhLine[5];
+				mem = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+				commandtype = SeventhLine[6].trim();
+				log.info("command type in NDN is " + commandtype);
+			}
+			//////////// NDN FOR SET COMMAND ////////////
+			if (commandtype.equalsIgnoreCase("4")) {
+				dbProcess.generateAlert(shipBorneEquipmentId, 104);
+				referenceCspId = dbProcess.getcspid(Integer.parseInt(dnidno), Integer.parseInt(shipBorneEquipmentId));
+
+				/// checking if set is against Download DNID
+				int rootCommandType = dbProcess.fetchCommandtype(referenceCspId);
+				if (rootCommandType == 10) {
+					String imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+
+					dbProcess.updateAspDnidDB(imo_no, "SET_FREQ_FAILED", true);
+				}
+
+			}
+
+			/////////// NDN FOR ONE TIME POLL ///////////
+			if (commandtype.equalsIgnoreCase("0")) {
+				commandtype = removeLastCharacter(commandtype.trim());
+				log.info("last character removed");
+				log.info("commandtype=" + commandtype);
+				dbProcess.generateAlert(shipBorneEquipmentId, 116);
+
+				flag1 = dbProcess.updateCSPTransaction(referenceCspId, status, Integer.valueOf(commandtype));
+				if (flag1 == true) {
+					log.info("TRANSACTION UPDATED FOR NDN");
+				}
+
+			}
+			if (commandtype.equalsIgnoreCase("11")) {
+
+				String imo_no;
+				imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+				dbProcess.generateAlert(shipBorneEquipmentId, 112);
+				dbProcess.setstatusVesselDetails(imo_no, "DNID_DELETE_FAILED", dbProcess.getCurrentTimestamp(),
+						"DNID_DELETE_REQ");
+				flag1 = dbProcess.updateCSPTransaction(referenceCspId, status, Integer.valueOf(commandtype));
+				if (flag1 == true) {
+					log.info("TRANSACTION UPDATED For NDN");
+				}
+
+			}
+
+			/////////// NDN FOR DOWNLOAD DNID COMMAND ///////////
+			if (commandtype.equalsIgnoreCase("10")) {
+				dbProcess.generateAlert(shipBorneEquipmentId, 102);
+
+				String imo_no;
+				imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+				dbProcess.setstatusVesselDetails(imo_no, "DNID_DW_FAILED", dbProcess.getCurrentTimestamp(),
+						"DNID_DW_REQ");
+
+				flag1 = dbProcess.updateCSPTransaction(referenceCspId, status, Integer.valueOf(commandtype));
+				if (flag1 == true) {
+					log.info("TRANSACTION UPDATED For NDN");
+				}
+
+			}
+
+			////////// NDN FOR START COMMAND /////////
+			if (commandtype.equalsIgnoreCase("5")) {
+				dbProcess.generateAlert(shipBorneEquipmentId, 106);
+				/// checking if start is against Download DNID
+				int rootCommandType = dbProcess.fetchCommandtype(referenceCspId);
+				if (rootCommandType == 10) {
+					String imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+
+					dbProcess.updateAspDnidDB(imo_no, "START_FAILED", true);
+				}
+				dbProcess.setStatusTxn(status, referenceCspId, Integer.valueOf(commandtype));
+
+			}
+
+			///////// NDN FOR STOP COMMAND /////////
+			if (commandtype.equalsIgnoreCase("6")) {
+				dbProcess.generateAlert(shipBorneEquipmentId, 110);
+				dbProcess.setStatusTxn(status, referenceCspId, Integer.valueOf(commandtype));
+
+			}
+
+			flag = dbProcess.logCspTransaction(referenceCspId, "CSP", "ASP", dbProcess.getCurrentTimestamp(), subject,
+					Integer.valueOf(dnidno), 0, mem, null, email, "Negative Delivery Notification", false);
+			if (flag == true) {
+				log.info("EMAIL LOGGED SUCCESSFULL");
+			}
+
+		}
+
+		////////////////////// PROCESSING OF PDN ///////////////////
+
+		else if (typeOfEmail.trim().contains("Positive")) {
+
+			log.info("EMAIL IS POSITIVE DELIVERY NOTIFICATION");
+			String[] lines = email.split("\\r?\\n");
+			for (String line : lines) {
+				log.debug(line);
+			}
+			String dnidno;
+			String shipBorneEquipmentId;
+			try {
+				String[] fourthLine = lines[4].split(",");
+
+				for (String comma : fourthLine) {
+					log.debug(comma);
+				}
+
+				dnidno = fourthLine[2].trim();
+				shipBorneEquipmentId = fourthLine[5].trim();
+
+				log.info("dnid no. is" + dnidno);
+				log.info("shipequipmentID is  " + shipBorneEquipmentId);
+
+				boolean flag1 = false;
+
+				String commandType = null;
+				if (fourthLine.length < 8) {
+					if (fourthLine[6].trim().length() > 1) {
+						char last = fourthLine[6].trim().charAt(1);
+						if ((last != 0) || (last != 1)) {
+							fourthLine[6] = removeLastCharacter(fourthLine[6].trim());
+						}
+					}
+				}
+				int commandTypeinMail = Integer.parseInt(fourthLine[6].trim());
+				log.info("request Type= " + commandTypeinMail);
+
+				int memNo = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+				log.info("memno. is " + memNo);
+
+				String referenceCspId = dbProcess.getcspid(Integer.parseInt(dnidno),
+						Integer.parseInt(shipBorneEquipmentId));
+
+				flag1 = dbProcess.logCspTransaction(referenceCspId, "CSP", "ASP", dbProcess.getCurrentTimestamp(),
+						subject, Integer.valueOf(dnidno), 0, memNo, null, email, "Positive Delivery Notification",
+						false);
+
+				if (flag1 == true) {
+					log.info("EMAIL LOGGED SUCCESSFULL");
+				}
+
+				if (commandTypeinMail == 10) {
+					log.info("command type is " + commandType);
+					boolean flag4 = dbProcess.checkDnid(dnidno, "DNID Commands");
+					if (flag4 == true) {
+						log.info("member number= " + memNo);
+						log.info("length= " + fourthLine.length);
+						log.info("Generate Alert");
+
+						String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+						dbProcess.setstatusVesselDetails(imo_no, "DNID_DOWNLOADED", dbProcess.getCurrentTimestamp(),
+								"DNID_DW_REQ");
+					}
+				}
+
+				if (commandTypeinMail == 11) {
+					log.info("command type is " + commandType);
+
+					// referenceCspId = dbProcess.getcspid(Integer.parseInt(dnidno),
+					// Integer.parseInt(shipBorneEquipmentId));
+
+					boolean flag2 = dbProcess.checkIfdeletePDNReceived(dnidno, referenceCspId, memNo);
+
+					if ((flag2 == true) && (memNo != 0)) {
+						log.info("First PDN for delete request");
+						log.info("Generate Alert");
+						dbProcess.generateAlert(shipBorneEquipmentId, 111);
+						log.info("setting MAIL ");
+						arg0.getOut().setHeader("MAIL", false);
+						arg0.getOut().setBody(null);
+					} else {
+						log.info("setting MAIL ");
+						arg0.getOut().setHeader("MAIL", false);
+						arg0.getOut().setBody(null);
+					}
+
+					boolean flag3 = dbProcess.checkDnid(dnidno, "DNID Commands");
+					if (flag3 == true) {
+						log.info("member number= " + memNo);
+						log.info("length= " + fourthLine.length);
+						String imo_no;
+						String status;
+						imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+						// method to check the status in portal_vessel_detail table.if it is
+						// "DNID_DEL_REQ"
+						status = dbProcess.fetchPortalStatus(imo_no);
+						status = status.trim();
+						log.info("status is " + status);
+
+						if (status.equals("DNID_DEL_REQ")) {
+							log.info("DNID DELETION");
+							dbProcess.setstatusDnidDeleted(imo_no, "DNID_DELETED", dbProcess.getCurrentTimestamp());
+							dbProcess.deleteDnidMemberNo(imo_no);
+						} else if (status.equals("DNID_SEID_DEL_REQ")) {
+							log.info("DNID SEID DELETION");
+							dbProcess.setstatusDnidDeleted(imo_no, "SEID_DELETED", dbProcess.getCurrentTimestamp());
+							dbProcess.deleteSEID_DNID(imo_no);
+						}
+					}
+				}
+
+				log.info("command Type in Mail = " + commandTypeinMail);
+				// log.info("*********************************************working should be done
+				// here ");
+				if (commandTypeinMail == 10) {
+					log.info("dnid no from mail is " + dnidno);
+					referenceCspId = dbProcess.getcspid(Integer.parseInt(dnidno),
+							Integer.parseInt(shipBorneEquipmentId));
+					log.info("referencecspid" + referenceCspId);
+					log.info("shipbornequipment is from mail is" + shipBorneEquipmentId);
+					if (dbProcess.checkDownloadPDNReceived(referenceCspId, commandTypeinMail) == false) {
+						log.info("First PDN");
+
+						flag1 = dbProcess.updateCSPTransaction(referenceCspId, "PDN RECEIVED", commandTypeinMail);
+						if (flag1 == true) {
+							log.info("TRANSACTION UPDATED For PDN");
+						}
+						log.info("status set for command type " + commandTypeinMail);
+						dbProcess.generateAlert(shipBorneEquipmentId, 101);
+						int mem = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+						String imo = dbProcess.getimo_num(mem, Integer.valueOf(dnidno));
+						// dbProcess.fetchfrequecyMinimum(imo);
+						Calendar calendar = Calendar.getInstance();
+
+						// TimeZone.getTimeZone("Asia/Calcutta"time
+						/**************************/
+						Timestamp time = dbProcess.fetchTimefrequency(imo);
+						log.info("time is for this imo" + time);
+
+						/* logic for reducing time by 15 minutes */
+						/*
+						 * Calendar cal = Calendar.getInstance(); cal.setTimeInMillis(time.getTime());
+						 * cal.add(Calendar.MINUTE, -15); Timestamp setSendingTime = new
+						 * Timestamp(cal.getTime().getTime());
+						 * 
+						 * log.info("Sending time is for  "+ setSendingTime);//after reducing time by 15
+						 * minutes
+						 */
+
+						String lrit_id = dbProcess.getCgOwnerFromIMONO(imo);
+						dbProcess.setstatusTerminal(lrit_id, imo, "ACTIVE");
+						calendar.setTimeInMillis(time.getTime());
+						/* for reducing time to 15minutes */
+
+						/* logic for 7 minutes diff */
+						/*
+						 * Calendar cal1 = Calendar.getInstance();
+						 * cal1.setTimeInMillis(setSendingTime.getTime()); cal1.add(Calendar.MINUTE,7);
+						 * Timestamp startSendingTime = new Timestamp(cal1.getTime().getTime());
+						 * 
+						 * log.info("Sending time is for  "+ startSendingTime);//after reducing time by
+						 * 15 minutes
+						 */
+						// calendar.setTimeInMillis(time.getTime());
+						/* for reducing time to 15minutes */
+
+						// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+						// LocalDateTime time= LocalDateTime.now() ;
+						log.info("calender indian timezone::" + calendar);
+						int HH = calendar.get(Calendar.HOUR_OF_DAY);
+						int mm = calendar.get(Calendar.MINUTE);
+						int ss = calendar.get(Calendar.SECOND);
+						// log.info("reached here");
+						String messageID = dbProcess.getmessageID(imo);
+						log.info(messageID + "message id is");
+						if (messageID != null) {
+							dbProcess.setposReqTime(time, messageID);
+						}
+						log.info(HH + ":" + mm + ":" + ss);
+						int frame = calFrame(HH, mm, ss);
+						log.info("creating set poll command");
+
+						// code for inserting in new table detail of timestamp
+
+						// boolean flag_check = false;
+
+						// getting current timestamp
+						// Timestamp lrit_timestamp =dbProcess.getCurrentTimestamp();
+
+						// inserting data in new table
+						// true - means the SET request is active and mail is yet to be sent.
+
+						// checkreport(referenceCspId)juyj
+
+						// dbProcess.terminateallRequest(imo);
+						dbProcess.insertAspDcTxn(messageId, "", "ASP", "CSP", dbProcess.getCurrentTimestamp(),
+								BigInteger.valueOf(4), dbProcess.getimo_num(mem, Integer.valueOf(dnidno)), "Set");
+
+						log.info(
+								"***********************************************Inserting in asp_Terminal ***********************************");
+						// dbProcess.insertTerminalfrequency(messageId,
+						// dbProcess.getimo_num(mem,
+						// Integer.valueOf(dnidno)),dnidno,mem,"1065",360,dbProcess.getCurrentInstance(),"ACTIVE");
+						String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+						String modeltype = dbProcess.fetchmodeltype(modelid);
+						commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(mem),
+								shipBorneEquipmentId, String.valueOf(frame), "4", modeltype);
+						flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+								dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+								Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+
+						int rootCommandType = dbProcess.fetchCommandtype(referenceCspId);
+						if (rootCommandType == 10) {
+							String imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+
+							dbProcess.updateAspDnidDB(imo_no, "SET_FREQ_TRIGGERED", true);
+
+						}
+					} else {
+						log.info("setting MAIL ");
+						arg0.getOut().setHeader("MAIL", false);
+						arg0.getOut().setBody(null);
+					}
+				}
+				////////////////////// PDN FOR SET COMMAND //////////////////////
+				if (commandTypeinMail == 4) {
+					boolean check = dbProcess.checkStartsent(referenceCspId);
+					if (check == true) {
+						arg0.getOut().setHeader("MAIL", false);
+						arg0.getOut().setBody(null);
+
+					} else {
+						int mem = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+						log.info("Generate ALert");
+						dbProcess.generateAlert(shipBorneEquipmentId, 103);
+						String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+						String modeltype = dbProcess.fetchmodeltype(modelid);
+						commandType = pollCommandType.prepareStartPollCommand(dnidno, String.valueOf(mem),
+								shipBorneEquipmentId, modeltype);
+
+						// should be commented because it is logging the START command in DB (START
+						// command should be independent)
+						flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+								dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+								Integer.valueOf(dnidno), 0, memNo, 5, "START", "Start Command", false);
+						/////////// code to update status in ASP_DNID_table ////////////
+						int rootCommandType = dbProcess.fetchCommandtype(referenceCspId);
+						if (rootCommandType == 10) {
+							String imo_no = dbProcess.getimo_num(mem, Integer.parseInt(dnidno));
+
+							dbProcess.updateAspDnidDB(imo_no, "START_TRIGGERED", true);
+						}
+					}
+				} else if (commandTypeinMail == 0) /////// ONE TIME POLL PROCESSING
+
+				{
+					log.info("Generating Alert");
+					dbProcess.generateAlert(shipBorneEquipmentId, 115);
+
+					arg0.getOut().setHeader("MAIL", false);
+					arg0.getOut().setBody(null);
+
+				} else if (commandTypeinMail == 6) {
+					// log.info("Generating Alert");
+					// dbProcess.generateAlert(shipBorneEquipmentId, 109);
+					boolean flag3 = dbProcess.checkIfStopPDNReceived(dnidno, referenceCspId, memNo);
+
+					if (flag3 == false) {
+						int frame = 0;
+						dbProcess.generateAlert(shipBorneEquipmentId, 109);
+						int requestType = dbProcess.checkrequestType(shipBorneEquipmentId);
+						Calendar calendar = Calendar.getInstance();
+						if (requestType != 12) {
+
+							flag = dbProcess.checkIsSet(dnidno);
+							String newMessageID = dbProcess.fetchMessageID(referenceCspId);
+							Timestamp startTime = dbProcess.fetchstartTime(newMessageID);
+
+							// Calendar calendar = Calendar.getInstance();
+							calendar.setTimeInMillis(startTime.getTime());
+							// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+							log.info("Start Time will be " + calendar);
+							int HH = calendar.get(Calendar.HOUR_OF_DAY);
+							;
+							int mm = calendar.get(Calendar.MINUTE);
+							int ss = calendar.get(Calendar.SECOND);
+							frame = calFrame(HH, mm, ss);
+							log.info("time is :: " + HH + ":" + mm + ":" + ss);
+							// int
+							// mem=dbProcess.fetchmem(shipBorneEquipmentId.trim());
+							log.info("Request type is " + requestType);
+						} else {
+							// Calendar calendar = Calendar.getInstance();
+							String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+							int delay = dbProcess.getDelay(imo_no);
+							Instant instant = getSynctime(
+									timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 360, delay);
+							Timestamp next = Timestamp.from(instant);
+							log.info("next timestamp is" + next);
+
+							calendar.setTimeInMillis(next.getTime());
+							// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+							calendar.add(Calendar.MINUTE, 15);
+							int HH = calendar.get(Calendar.HOUR_OF_DAY);
+							;
+							int mm = calendar.get(Calendar.MINUTE);
+							int ss = calendar.get(Calendar.SECOND);
+							frame = calFrame(HH, mm, ss);
+							log.info("time is :: " + HH + ":" + mm + ":" + ss);
+							// int
+							// mem=dbProcess.fetchmem(shipBorneEquipmentId.trim());
+							log.info("Request type is " + requestType);
+						}
+
+						int mem = dbProcess.fetchmem(shipBorneEquipmentId.trim());
+						log.info("Request type is " + requestType);
+						if (requestType == 12) {
+							String imo = dbProcess.getimo_num(memNo, Integer.valueOf(dnidno));
+							int frequency = dbProcess.fetchfrequecyMinimum(imo);
+							log.info("frequency =" + frequency);
+							if (frequency == 15) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 15, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "96", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							} else if (frequency == 30) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 30, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 3 ");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "48", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							} else if (frequency == 60) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 60, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 3 ");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "24", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+
+							} else if (frequency == 180) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 180, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 5");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "8", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+
+							} else if (frequency == 360) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 360, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								/// log.info("preparing set poll command request
+								/// type 6");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "4", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							}
+						}
+						if (requestType == 0) {
+							String imo = dbProcess.getimo_num(memNo, Integer.valueOf(dnidno));
+							int frequency = dbProcess.fetchfrequecyMinimum(imo);
+							log.info("frequency =" + frequency);
+							if (frequency == 15) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 15, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "96", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							} else if (frequency == 30) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 30, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 3 ");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "48", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							} else if (frequency == 60) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 60, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 3 ");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "24", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+
+							} else if (frequency == 180) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 180, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								// log.info("preparing set poll command request
+								// type 5");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "8", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+
+							} else if (frequency == 360) {
+								String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+								int delay = dbProcess.getDelay(imo_no);
+								Instant instant = getSynctime(
+										timeStampToXMLGregorianCalender(dbProcess.getCurrentTimestamp()), 360, delay);
+								Timestamp next = Timestamp.from(instant);
+								log.info("next timestamp is" + next);
+
+								calendar.setTimeInMillis(next.getTime());
+								// calendar.setTimeZone(TimeZone.getTimeZone("Asia/Calcutta"));
+								// calendar.add(Calendar.MINUTE,15);
+								int HH = calendar.get(Calendar.HOUR_OF_DAY);
+								;
+								int mm = calendar.get(Calendar.MINUTE);
+								int ss = calendar.get(Calendar.SECOND);
+								frame = calFrame(HH, mm, ss);
+								log.info("time is :: " + HH + ":" + mm + ":" + ss);
+
+								/// log.info("preparing set poll command request
+								/// type 6");
+								String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+								String modeltype = dbProcess.fetchmodeltype(modelid);
+								commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+										shipBorneEquipmentId, String.valueOf(frame), "4", modeltype);
+								flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+										dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+										Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+							}
+
+						}
+						if (requestType == 8) {
+							String imo = dbProcess.getimo_num(memNo, Integer.valueOf(dnidno));
+							dbProcess.terminateallRequest(imo);
+							arg0.getOut().setHeader("MAIL", false);
+							arg0.getOut().setBody(null);
+							/*
+							 * log.error("no email against stop"); throw new EmailFormatException
+							 * ("NO email against stop");
+							 */
+
+						}
+
+						if (requestType == 2) {
+							log.info("preparing set poll command request type 2 ");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "96", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 3) {
+							log.info("preparing set poll command request type 3 ");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "48", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 4) {
+							log.info("preparing set poll command request type 4");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "24", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 5) {
+							log.info("preparing set poll command request type 5");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "8", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 6) {
+							log.info("preparing set poll command request type 6");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "4", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 10) {
+							log.info("preparing set poll command request type 10");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "2", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						} else if (requestType == 11) {
+							log.info("preparing set poll command request type 11");
+							String modelid = dbProcess.fetchmodelid(shipBorneEquipmentId);
+							String modeltype = dbProcess.fetchmodeltype(modelid);
+							commandType = pollCommandType.prepareSetPollCommand(dnidno, String.valueOf(memNo),
+									shipBorneEquipmentId, String.valueOf(frame), "1", modeltype);
+							flag = dbProcess.logCspTransaction(referenceCspId, "ASP", "CSP",
+									dbProcess.getCurrentTimestamp(), pollCommandType.getPollCommand(),
+									Integer.valueOf(dnidno), 0, mem, 4, "SET", "SET Command", false);
+						}
+
+					} else {
+						arg0.getOut().setHeader("MAIL", false);
+						arg0.getOut().setBody(null);
+
+						/*
+						 * log.error("Set request Already initiated"); throw new EmailFormatException
+						 * ("No set request");
+						 */}
+
+				} else if (commandTypeinMail == 5) {
+					boolean flag3 = dbProcess.checkPdnReceived(referenceCspId, commandTypeinMail);
+					if (flag3 == false) {
+						/* dbProcess.setStatusTxn(referenceCspId, commandTypeinMail); */
+						dbProcess.setStatusTxn("PDN RECEIVED", referenceCspId, commandTypeinMail);
+						log.info("Generate Alert");
+						dbProcess.generateAlert(shipBorneEquipmentId, 105);
+						int rootCommandType = dbProcess.fetchCommandtype(referenceCspId);
+						if (rootCommandType == 10) {
+							String imo_no = dbProcess.getimo_num(memNo, Integer.parseInt(dnidno));
+
+							dbProcess.updateAspDnidDB(imo_no, "SHIP_CONFIGURED", true);
+						}
+					}
+
+					arg0.getOut().setHeader("MAIL", false);
+					arg0.getOut().setBody(null);
+
+				}
+				log.info("poll command is :::" + pollCommandType.getPollCommand());
+				// String contains =null;
+				arg0.getOut().setHeader("choice", "PDN");
+
+				log.info("[" + pollCommandType.getPollCommand() + "");
+
+				// dbProcess.logCspTransaction(referenceCspId,dcid,dbProcess.getId("CSP"),timestamp1,pollCommandType.getPollCommand(),Integer.parseInt(dnidno),Integer.parseInt(shipBorneEquipmentId)
+				// ,Integer.parseInt(memNo),
+				// Integer.parseInt(commandType),"null","poll Command",false);
+				// String
+				// cspiD=dbProcess.getcspid(Integer.valueOf(dnidno),Integer.valueOf(shipBorneEquipmentId.trim()));
+				// dbProcess.insertcspdcmapping( messageId,cspiD);
+
+				// if ((commandTypeinMail != 4) && (commandTypeinMail != 5)) {
+
+				arg0.getOut().setHeader("from", dbProcess.getGolbalProperties("ASP"));
+				arg0.getOut().setHeader("subject", pollCommandType.getPollCommand());
+				arg0.getOut().setHeader("to", dbProcess.getGolbalProperties("CSP"));
+				arg0.getOut().setHeader("request_status", "Success");
+
+				// }
+			} catch (Exception e) {
+				log.error(" in  processing _PDN " + e.getMessage() + " *** " + e.getCause() + " *** "
+						+ e.getStackTrace().toString());
+
+			}
+		} else {
+			log.error(" EMAIL DOES NOT BELONG TO ANYTYPE ");
+			throw new EmailFormatException("UNRECOGNISED EMAIL");
+
+		}
+	}
+
+	private BigDecimal convertLocation(Double degree, Double minute, String direction) throws EmailFormatException {
+		BigDecimal pos;
+		if ((direction.equals("S") || direction.equals("W"))) {
+			pos = new BigDecimal((degree + (minute / 60)));
+			pos = pos.multiply(new BigDecimal(-1));
+
+		} else if ((direction.equals("N") || direction.equals("E"))) {
+			pos = new BigDecimal((degree + (minute / 60)));
+		} else {
+			throw new EmailFormatException("Location Invalid");
+		}
+		return pos;
+	}
+
+	boolean emailValidation(String from, String email) {
+
+		if (from.endsWith(email)) {
+			return true;
+		} else
+			return false;
+	}
+
+	String identifyEmailType(String body, String subject) {
+		log.info("Inside Identify mail type method");
+		String NDN = "Negative Delivery notification";
+		String PDN = "Positive Delivery notification";
+		String PR = "Maritime Mobile Position Report";
+		String UR = "Unknown Type Position Report";
+		String spam = "Spam";
+		if (subject.contains(NDN)) {
+			return NDN;
+		} else if (subject.contains(PDN)) {
+			return PDN;
+		} else if (body.contains("Maritime Mobile Position Report")) {
+			return PR;
+		} else if (body.contains("Unknown Type Position Report")) {
+			return UR;
+		} else
+			return spam;
+
+	}
+
+	public static String removeLastCharacter(String str) {
+		String result = null;
+		if ((str != null) && (str.length() > 0)) {
+			result = str.substring(0, str.length() - 1);
+		}
+		return result;
+	}
+
+	String marshallPositionReport(ShipPositionReportType shipPositionReportType) throws JAXBException {
+		JAXBContext jxbc = JAXBContext.newInstance(ShipPositionReportType.class);
+		Marshaller marshl = jxbc.createMarshaller();
+		marshl.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+		StringWriter xmlBody = new StringWriter();
+		org.imo.gisis.xml.lrit.positionreport._2008.ObjectFactory of = new org.imo.gisis.xml.lrit.positionreport._2008.ObjectFactory();
+		marshl.marshal(of.createShipPositionReport(shipPositionReportType), xmlBody);
+		return xmlBody.toString();
+	}
+
+	public String extractResponse(Response response) {
+		try {
+			JAXBContext jaxbContext = JAXBContext.newInstance(Response.class);
+			Marshaller jaxbMarshaller = jaxbContext.createMarshaller();
+			jaxbMarshaller.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+			StringWriter sw = new StringWriter();
+			jaxbMarshaller.marshal(response, sw);
+			return sw.toString();
+		} catch (Exception ex) {
+
+			log.error("issue in extractResponse marshalling returning null");
+		}
+		return null;
+	}
+
+	public String marshellResponseBody(Response resp) throws JAXBException {
+		StringWriter xmlBody = new StringWriter();
+		JAXBContext jxbc = JAXBContext.newInstance(Response.class);
+		Marshaller marshl = jxbc.createMarshaller();
+		marshl.setProperty(Marshaller.JAXB_FORMATTED_OUTPUT, Boolean.TRUE);
+		org.imo.gisis.xml.lrit.positionreport._2008.ObjectFactory of = new org.imo.gisis.xml.lrit.positionreport._2008.ObjectFactory();
+		marshl.marshal(resp, xmlBody);
+		return xmlBody.toString();
+	}
+
+	public XMLGregorianCalendar timeStampToXMLGregorianCalender(Timestamp ldt) {
+		try {
+			log.info("Current Time to convert : " + ldt.getTime());
+			// DateFormat df = new
+			// SimpleDateFormat("YYYY-MM-dd'T'HH:mm:ss.sssX");
+			DateFormat df = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+			df.setTimeZone(TimeZone.getTimeZone("UTC"));
+			String date = df.format(ldt);
+			log.debug("date : " + date);
+			XMLGregorianCalendar XGC = DatatypeFactory.newInstance().newXMLGregorianCalendar(date);
+			log.debug("Current Time after convertion df format : " + XGC.toGregorianCalendar().getTime());
+			return XGC;
+		} catch (DatatypeConfigurationException e) {
+			e.printStackTrace();
+			return null;
+		}
+	}
+
+	public Instant getSynctime(XMLGregorianCalendar start_time, int frequencyRate, int delay) {
+
+		log.info("Inside Synchronise Method");
+		int Basetime = 1440; // 24hrs
+		int A = Basetime - frequencyRate;
+
+		Date start_date = start_time.toGregorianCalendar().getTime();
+
+		Date current_date = new Date();
+
+		log.info("Start Date : " + start_date);
+		log.info("Current Date : " + current_date);
+
+		Calendar calendar = Calendar.getInstance();
+		if (start_date.compareTo(current_date) <= 0) {
+			log.info("Start Time is already lapsed, so set to current time");
+			calendar.setTime(current_date);
+		} else {
+			log.info("Start Time is in future, so set to the start time");
+			calendar.setTime(start_date);
+		}
+
+		int hours = calendar.get(Calendar.HOUR_OF_DAY);
+		int minutes = calendar.get(Calendar.MINUTE);
+
+		log.info("Start Time :  Hour : Miniute :  " + hours + ": " + minutes);
+
+		int initialReqTimeMinutes = (hours * 60) + minutes;
+		int syncTime = 0;
+
+		log.info("Request Time in minutes : " + initialReqTimeMinutes);
+		log.info("A : " + A);
+		int B = A - initialReqTimeMinutes;
+		log.info("B : " + B);
+		if (B > frequencyRate) {
+			while (B > frequencyRate) {
+				Basetime = A;
+				log.debug("Modified BaseTime :  " + Basetime);
+				A = Basetime - frequencyRate;
+				log.debug("Modified A : " + A);
+				B = A - initialReqTimeMinutes;
+				log.debug("Modified B : " + B);
+			}
+		}
+		syncTime = A;
+		log.info("Calculated SYNC Start Time : " + syncTime);
+
+		syncTime = syncTime + delay;
+		log.info("Calculated SYNC Start Time + Delay : " + syncTime);
+
+		if ((syncTime - initialReqTimeMinutes) > frequencyRate + 30) {
+			log.info("Difference between sync time & request start time was greater than frequency time + 30 ");
+			syncTime = syncTime - frequencyRate;
+			log.info("Hence substracting frequencyrate , Now Sync Time : " + syncTime);
+		}
+
+		if ((syncTime - initialReqTimeMinutes) < 15) {
+			log.info("Difference between sync time & request start time was less than 15 minutes ");
+			syncTime = syncTime + frequencyRate;
+			log.info("Hence adding frequencyrate , Now Sync Time : " + syncTime);
+		}
+
+		while (((syncTime - frequencyRate) - initialReqTimeMinutes) > 15) {
+			log.info("Difference between sync time & request time greater than 15, subtract frequency rate");
+			syncTime = syncTime - frequencyRate;
+		}
+
+		hours = syncTime / 60;
+		minutes = syncTime % 60;
+
+		log.info("SYNC Start Time :: Hours:Minutes " + hours + ":" + minutes);
+		Calendar newcalendar = Calendar.getInstance();
+		newcalendar.set(Calendar.YEAR, calendar.get(Calendar.YEAR));
+		newcalendar.set(Calendar.MONTH, calendar.get(Calendar.MONTH));
+		newcalendar.set(Calendar.DAY_OF_MONTH, calendar.get(Calendar.DAY_OF_MONTH));
+		newcalendar.set(Calendar.HOUR_OF_DAY, hours);
+		newcalendar.set(Calendar.MINUTE, minutes);
+		newcalendar.set(Calendar.SECOND, 00);
+		newcalendar.set(Calendar.MILLISECOND, 00);
+		Date d = newcalendar.getTime();
+
+		Instant instant = d.toInstant();
+		log.info("Date : " + d.toString());
+		log.info("Instant :" + instant);
+		return instant;
+
+	}
+
+	private int calFrame(int HH, int mm, int ss) {
+		int frameNumber = (int) (((HH * 3600) + (mm * 60) + ss) / (8.64));
+		log.info("Frame number::" + frameNumber);
+		return frameNumber;
+	}
+
+}
